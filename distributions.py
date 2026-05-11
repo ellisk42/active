@@ -116,6 +116,10 @@ class Delta:
 
     def entropy(self):
         return 0.0
+    
+    def log_prob(self, value):
+        print("Warning: log_prob is not well-defined for a Delta distribution; returning 0")
+        return 0
 
     def __str__(self):
         return f"Delta({self.value.item():.4f}, range={self.legal_range})"
@@ -125,20 +129,22 @@ class Delta:
 
 class Beta:
 
-    def __init__(self, alpha, beta):
+    def __init__(self, alpha, beta, epsilon=0.01):
         self.legal_range = (0.0, 1.0)
+        self.epsilon = epsilon
         a = torch.as_tensor(alpha, dtype=torch.float32)
         b = torch.as_tensor(beta, dtype=torch.float32)
-        self.log_alpha = torch.log(torch.exp(a) - 1).requires_grad_(True)
-        self.log_beta = torch.log(torch.exp(b) - 1).requires_grad_(True)
+        # Invert alpha = softplus(log_alpha) + epsilon → log_alpha = log(expm1(alpha - epsilon))
+        self.log_alpha = torch.log(torch.expm1(a - epsilon)).requires_grad_(True)
+        self.log_beta = torch.log(torch.expm1(b - epsilon)).requires_grad_(True)
 
     @property
     def alpha(self):
-        return torch.nn.functional.softplus(self.log_alpha)
+        return torch.nn.functional.softplus(self.log_alpha) + self.epsilon
 
     @property
     def beta(self):
-        return torch.nn.functional.softplus(self.log_beta)
+        return torch.nn.functional.softplus(self.log_beta) + self.epsilon
 
     def sample(self):
         return torch.distributions.Beta(self.alpha, self.beta).rsample()
