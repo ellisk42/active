@@ -192,24 +192,8 @@ class BottomUpProposalExpert(Expert):
         return proposed_state, 0.
 
 
-# --- Rendering helpers ---
-
-ANSI = {
-    "black": "\033[40m",
-    "grey":  "\033[47m",
-    "green": "\033[42m",
-}
-RESET = "\033[0m"
-
-def render_cell(color):
-    code = ANSI.get(color, ANSI["black"])
-    char = " " if color == "black" else "X"
-    return f"{code}{char}{RESET}"
-
 def print_observation(observation):
-    observation = list(zip(*observation))  # transpose
-    for row in observation:
-        print("".join(render_cell(cell) for cell in row))
+    actual_model.pretty_print_observation(observation)
 
 
 # --- Shared distribution factories for the bugs domain ---
@@ -231,6 +215,7 @@ actual_model = PoE_POMDP(
     dynamics_distributions=[_point(1.), _point(9.), _point(1.), _point(9.), _point(9.)],
     render_rules=[RenderBugRule(), RenderFoodRule()],
     render_distributions=[_point(1.), _point(9.)],
+    initial_belief=[initial_state],
     width=W, height=H, bottomup_proposal=BottomUpProposalExpert())
 actions = ["nothing"] + ["click"] * 2 + ["nothing"] * (T - 3)
 print(actual_model.parameters())
@@ -246,13 +231,13 @@ for t, (state, observation, action) in enumerate(zip(states, observations, actio
     print_observation(observation)
     print()
 
-logZ = actual_model.particle_filter(initial_belief=[initial_state], observations=observations, actions=actions, num_particles=1)[1]
+logZ = actual_model.particle_filter(observations=observations, actions=actions, num_particles=1)[1]
 print(f"Log marginal likelihood of data under actual model: {logZ.item():.2f}")
 
 
 # --- Experiment harness ---
 
-def run_experiment(posterior_factory, prior_factory, label, actual_logZ=None, steps=1000, num_state_particles=1):
+def run_experiment(posterior_factory, prior_factory, label, actual_logZ=None, steps=1000, num_state_particles=1, num_weight_samples=1, num_trajectories=1):
     """
     posterior_factory: callable() -> fresh weight posterior per rule
     prior_factory:     callable() -> fresh weight prior per rule
@@ -269,6 +254,7 @@ def run_experiment(posterior_factory, prior_factory, label, actual_logZ=None, st
         dynamics_distributions=[make_dist() for _ in range(7)],
         render_rules=[RenderBugRule(), RenderFoodRule()],
         render_distributions=[make_dist() for _ in range(2)],
+        initial_belief=[initial_state],
         width=W, height=H,
         bottomup_proposal=BottomUpProposalExpert())
 
@@ -290,7 +276,7 @@ def run_experiment(posterior_factory, prior_factory, label, actual_logZ=None, st
             ax.plot(vals, color='steelblue', alpha=0.35, linewidth=0.8)
             ax.plot(ewa(vals), color='steelblue', linewidth=1.8, label='EWA')
             if key == 'data_likelihood_curve' and actual_logZ is not None:
-                ax.axhline(actual_logZ, color='red', linestyle='--', label='actual model')
+                ax.axhline(actual_logZ*num_trajectories, color='red', linestyle='--', label='actual model')
             ax.legend(fontsize=8)
             ax.set_title(title)
         fig.suptitle(f"{label} — training curves (step {step})")
@@ -328,16 +314,18 @@ def run_experiment(posterior_factory, prior_factory, label, actual_logZ=None, st
         with open(f"export/{slug}_checkpoint.pkl", "wb") as f:
             pickle.dump(learned_model, f)
 
-    logZ_before = learned_model.particle_filter(initial_belief=[initial_state], observations=observations, actions=actions, num_particles=num_state_particles)[1]
+    logZ_before = learned_model.particle_filter(observations=observations, actions=actions, num_particles=num_state_particles)[1]
+    logZ_before *= num_trajectories  # we will be training on num_trajectories copies of the same trajectory, so the log-likelihood should scale linearly with this
     print(f"Log marginal likelihood before training: {logZ_before.item():.2f}")
 
     for step, training_curves in learned_model.train(
             lr=0.01, iterations=steps, dump_every=50,
-            observations=observations, actions=actions, initial_state=initial_state,
+            trajectories=[(observations, actions)]*num_trajectories,
             num_particles=num_state_particles, num_weight_samples=1, num_smoothing_samples=1):
         dump_plots(step, training_curves)
 
-    logZ_after = learned_model.particle_filter(initial_belief=[initial_state], observations=observations, actions=actions, num_particles=num_state_particles)[1]
+    logZ_after = learned_model.particle_filter(observations=observations, actions=actions, num_particles=num_state_particles)[1]
+    logZ_after *= num_trajectories  # we will be training on num_trajectories copies of the same trajectory, so the log-likelihood should scale linearly with this
     print(f"Log marginal likelihood after training:  {logZ_after.item():.2f}")
 
     print(learned_model)
@@ -378,7 +366,7 @@ def compare_policies(learner, policies_with_labels, n_rollouts=10,
     fig, ax = plt.subplots(figsize=(8, 4))
     for policy, label in policies_with_labels:
         gains = learner.rollout_policy(policy, n_rollouts=n_rollouts)
-        ax.plot(gains, label=label)
+        ax.plot([0]+gains, label=label, marker='o')
         print(f"Expected information gain from {label}: {gains} -> {sum(gains):.4f} nats")
     ax.set_title("Expected information gain from different policies")
     ax.set_xlabel("Time step")
@@ -408,6 +396,7 @@ if __name__ == "__main__":
     train_p = sub.add_parser("train", help="Train via variational inference")
     train_p.add_argument("--steps", type=int, default=1000)
     train_p.add_argument("--num-state-particles", type=int, default=10)
+    train_p.add_argument("--num-trajectories", type=int, default=10)
 
     al_p = sub.add_parser("active", help="Active learning / info-gain planning")
     al_p.add_argument("--checkpoint", default="export/Beta_posterior_variational_final_model.pkl")
@@ -424,13 +413,14 @@ if __name__ == "__main__":
             label="Beta posterior (variational)",
             actual_logZ=logZ.item(),
             steps=args.steps,
-            num_state_particles=args.num_state_particles)
+            num_state_particles=args.num_state_particles,
+            num_trajectories=args.num_trajectories)
 
     elif args.command == "active":
         model = load_model(args.checkpoint)
         learner = ActiveLearner(model, num_model_particles=args.num_model_particles,
                                 num_state_particles=args.num_state_particles)
-        learner.init_tree([initial_state])
+        learner.init_tree()
         compare_policies(
             learner,
             policies_with_labels=[

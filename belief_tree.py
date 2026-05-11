@@ -15,7 +15,11 @@ from distributions import Categorical
 
 
 class BeliefNode:
-    """Particle cloud over (model_idx, state) pairs at one point in the tree."""
+    """
+    Particle cloud over hidden states at one point in the tree.
+    Note "hidden state" here could be model parameters, world state, or both (or something else)
+    Just think of it as a bag of particles representing belief over a latent thing
+    """
 
     def __init__(self, particles, tree):
         self.particles = particles   # list of (model_idx, state)
@@ -38,18 +42,11 @@ class BeliefNode:
                 raise ValueError("Child already exists for this (action, observation) pair.")
         self.children[action].append((observation, child))
 
-    def model_entropy(self):
-        """Entropy of the marginal distribution over world-model particles."""
-        counts = {}
-        for model_idx, _ in self.particles:
-            counts[model_idx] = counts.get(model_idx, 0) + 1
-        n = len(self.particles)
-        return -sum((c / n) * math.log(c / n) for c in counts.values())
 
 
 class BeliefTree:
     """
-    Particle-based belief tree for information-gain planning.
+    Particle-based belief tree for belief space planning.
 
     possible_models: a fixed list of sampled world-model copies, shared across
     all nodes.  Each particle in a BeliefNode is (i, state) where i indexes
@@ -108,40 +105,3 @@ class BeliefTree:
 
         return observation, new_node
 
-    # --- Planning methods ---
-
-    def rollout(self, policy, node=None, observations=(), actions=()):
-        """Follow policy from node, returning per-step info gains.
-
-        policy(observations, actions) → action | None.
-        observations / actions grow as the rollout proceeds and are passed
-        back to the policy at each step so adaptive policies can react.
-        expand is called with add_to_tree=False so rollouts stay independent.
-        """
-        if node is None:
-            node = self.root
-        observations, actions = list(observations), list(actions)
-        gains = []
-        while True:
-            a = policy(observations, actions)
-            if a is None:
-                break
-            actions.append(a)
-            obs, child = self.expand(node, a, add_to_tree=False)
-            observations.append(obs)
-            gains.append(node.model_entropy() - child.model_entropy())
-            node = child
-        return gains
-
-    def plan_info_gain(self, policy, num_rollouts=10, observations=(), actions=()):
-        """Monte Carlo estimate of per-step expected info gain under policy.
-
-        Returns a list of per-step average info gains.
-        """
-        per_step = []
-        for _ in range(num_rollouts):
-            for t, g in enumerate(self.rollout(policy, observations=observations, actions=actions)):
-                while len(per_step) <= t:
-                    per_step.append([])
-                per_step[t].append(g)
-        return [sum(gs) / len(gs) if gs else 0.0 for gs in per_step]

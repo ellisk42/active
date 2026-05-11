@@ -82,9 +82,15 @@ class WorldModel(ABC):
     def pretty_print_observation(self, obs):
         # works assuming that observation is a 2D array of colors
         ANSI = {
-            "black": "\033[40m",
-            "grey":  "\033[47m",
-            "green": "\033[42m",
+            "black":   "\033[40m",
+            "grey":    "\033[47m",
+            "white":   "\033[107m",
+            "red":     "\033[41m",
+            "green":   "\033[42m",
+            "yellow":  "\033[43m",
+            "blue":    "\033[44m",
+            "magenta": "\033[45m",
+            "cyan":    "\033[46m",
         }
         RESET = "\033[0m"
 
@@ -93,8 +99,7 @@ class WorldModel(ABC):
             char = " " if color == "black" else "X"
             return f"{code}{char}{RESET}"
 
-        observation = list(zip(*obs))  # transpose
-        for row in observation:
+        for row in zip(*obs):  # transpose
             print("".join(render_cell(cell) for cell in row))
 
     def parameter_distributions(self):
@@ -132,16 +137,18 @@ class WorldModel(ABC):
         """Sample o_{t+1} ~ p(o_{t+1} | o_{1:t}, a_{1:t})"""
         pass
 
-    def elbo(self, observations, actions, num_weight_samples=1, **kwargs) -> dict:
-        """Default ELBO: E_q[log p(o|w)] - KL(q||p), using reparameterized gradients.
+    def elbo(self, trajectories, num_weight_samples=1, **kwargs) -> dict:
+        """Default ELBO: E_q[log p(trajectories|w)] - KL(q||p), using reparameterized gradients.
         Assumes trajectory_log_likelihood is differentiable w.r.t. variational parameters.
+        trajectories is a list of pairs (observations, actions).
         Overridden by POMDP, which needs the Fisher trick because its likelihood estimator
         (particle filter) has no reparameterizable gradient."""
         ll = 0
         kl = 0
         for _ in range(num_weight_samples):
             self.resample_weights()
-            ll += self.trajectory_log_likelihood(observations, actions, **kwargs)
+            for observations, actions in trajectories:
+                ll += self.trajectory_log_likelihood(observations, actions, **kwargs)
             kl += self.KL_Q_to_prior()
         ll /= num_weight_samples
         kl /= num_weight_samples
@@ -197,6 +204,11 @@ class POMDP(WorldModel):
     elbo, plan_info_gain).
     """
 
+    def __init__(self, parameter_distributions, initial_belief, num_particles=100):
+        super().__init__(parameter_distributions)
+        self.initial_belief = list(initial_belief)
+        self.num_particles = num_particles
+
     @abstractmethod
     def next_state_log_likelihood(self, state, next_state, action):
         """log p(next_state | state, action)"""
@@ -220,15 +232,17 @@ class POMDP(WorldModel):
     def propose_next_state(self, prev_state, prev_action, curr_observation):
         """Propose a next state given the previous state, action, and current observation.
         Used for particle inference; can be overridden to incorporate the current observation into the proposal.
-        Returns (sample, log_prob of sample)"""
+        Returns (sample, log_prob of sample).
+        log_prob = None means that log_prob is """
         proposal = self.sample_next_state(prev_state, prev_action)
         return proposal, None
 
     # --- WorldModel implementations ---
 
-    def observation_log_likelihood(self, observation, past_observations, past_actions, initial_belief, num_particles):
+    def observation_log_likelihood(self, observation, past_observations, past_actions, num_particles=None):
         """Runs particle filter through past_observations/past_actions[:-1], then scores observation under past_actions[-1]."""
-        belief_states, _ = self.particle_filter(initial_belief, past_observations, past_actions[:-1], num_particles)
+        num_particles = num_particles or self.num_particles
+        belief_states, _ = self.particle_filter(past_observations, past_actions[:-1], num_particles)
         belief = belief_states[-1]
         particle_weights = []
         for particle in belief:
@@ -236,13 +250,14 @@ class POMDP(WorldModel):
             particle_weights.append(self.observation_log_likelihood_given_state(next_particle, observation))
         return torch.logsumexp(torch.tensor(particle_weights), dim=0) - math.log(num_particles)
 
-    def trajectory_log_likelihood(self, observations, actions, initial_belief, num_particles):
+    def trajectory_log_likelihood(self, observations, actions, num_particles=None):
         """Runs a single particle filter for efficiency rather than calling observation_log_likelihood per step."""
-        return self.particle_filter(initial_belief, observations, actions, num_particles)[1]
+        return self.particle_filter(observations, actions, num_particles or self.num_particles)[1]
 
-    def sample_observation(self, past_observations, past_actions, initial_belief, num_particles=100):
+    def sample_observation(self, past_observations, past_actions, num_particles=None):
         """Runs particle filter through past_observations/past_actions[:-1], then transitions with past_actions[-1]."""
-        belief_states, _ = self.particle_filter(initial_belief, past_observations, past_actions[:-1], num_particles)
+        num_particles = num_particles or self.num_particles
+        belief_states, _ = self.particle_filter(past_observations, past_actions[:-1], num_particles)
         state = random.choice(belief_states[-1])
         next_state = self.sample_next_state(state, past_actions[-1])
         return self.sample_observation_given_state(next_state)
@@ -259,12 +274,18 @@ class POMDP(WorldModel):
             observations.append(self.sample_observation_given_state(state))
         return states, observations
 
-    def particle_filter(self, initial_belief, observations, actions, num_particles):
-        """IMPORTANT! initial_belief is a list of states **for the first time step where there is an observation**
-        We actually ignore the first observation..."""
+    def particle_filter(self, observations, actions, num_particles=None):
+        num_particles = num_particles or self.num_particles
+        initial_belief = list(self.initial_belief)
 
         if len(initial_belief) < num_particles:
             initial_belief = initial_belief + random.choices(initial_belief, k=num_particles - len(initial_belief))
+
+        # reweighting and resampling of initial_belief based on observation[0]
+        particle_weights = [self.observation_log_likelihood_given_state(particle, observations[0]) for particle in initial_belief]
+        resampling_distribution = Categorical({i: w for i, w in enumerate(particle_weights)}).normalize()
+        initial_belief = [initial_belief[resampling_distribution.sample()] for _ in range(num_particles)]
+
 
         belief_states = [initial_belief]
 
@@ -294,9 +315,9 @@ class POMDP(WorldModel):
             logZ += dZ
         return belief_states, logZ
 
-    def particle_smoothing_sampler(self, initial_belief, observations, actions, num_particles):
+    def particle_smoothing_sampler(self, observations, actions, num_particles=None):
         """Yields samples from p(state_{1:T} | obs_{1:T}, actions_{1:T-1}) using a forward-filter backward-sample particle smoother."""
-        belief_states, _ = self.particle_filter(initial_belief, observations, actions, num_particles)
+        belief_states, _ = self.particle_filter(observations, actions, num_particles or self.num_particles)
         T = len(observations)
 
         assert len(belief_states) == T
@@ -326,13 +347,13 @@ class POMDP(WorldModel):
                 trajectory.insert(0, belief_states[t][weight_dist.sample()])
             yield trajectory
 
-    def fisher_objective(self, observations, actions, initial_state, num_particles, num_smoothing_samples=1):
+    def fisher_objective(self, observations, actions, num_particles=None, num_smoothing_samples=1):
         """grad log(obs) =  grad E_{p(states|obs)} log p(obs,states)"""
 
         objective = 0
 
         num_state_samples = 0
-        for trajectory in self.particle_smoothing_sampler(initial_belief=[initial_state], observations=observations, actions=actions, num_particles=num_particles):
+        for trajectory in self.particle_smoothing_sampler(observations=observations, actions=actions, num_particles=num_particles):
             objective += sum(self.observation_log_likelihood_given_state(state, obs) for state, obs in zip(trajectory, observations))
             for t in range(len(trajectory) - 1):
                 objective += self.next_state_log_likelihood(trajectory[t], trajectory[t + 1], actions[t])
@@ -342,7 +363,7 @@ class POMDP(WorldModel):
 
         return objective / num_state_samples
 
-    def elbo(self, observations, actions, initial_state, num_particles, num_weight_samples, num_smoothing_samples=1):
+    def elbo(self, trajectories, num_particles=None, num_weight_samples=1, num_smoothing_samples=1):
 
         fisher = 0
         data_likelihood = 0
@@ -350,9 +371,11 @@ class POMDP(WorldModel):
         for _ in range(num_weight_samples):
             self.resample_weights()
 
-            data_likelihood += self.trajectory_log_likelihood(observations=observations, actions=actions, initial_belief=[initial_state], num_particles=num_particles)
-            fisher += self.fisher_objective(observations, actions, initial_state, num_particles, num_smoothing_samples)
             kl += self.KL_Q_to_prior()
+
+            for observations, actions in trajectories:
+                data_likelihood += self.trajectory_log_likelihood(observations=observations, actions=actions, num_particles=num_particles)
+                fisher += self.fisher_objective(observations, actions, num_particles, num_smoothing_samples)
 
         fisher /= num_weight_samples
         data_likelihood /= num_weight_samples
@@ -377,8 +400,8 @@ class PoE_POMDP(POMDP):
     self.weights[:n_dynamics] are the dynamics weights; self.weights[n_dynamics:] are the render weights.
     """
 
-    def __init__(self, dynamics_rules, dynamics_distributions, render_rules, render_distributions, bottomup_proposal=None,width=4, height=4):
-        super().__init__(list(dynamics_distributions) + list(render_distributions))
+    def __init__(self, dynamics_rules, dynamics_distributions, render_rules, render_distributions, initial_belief, bottomup_proposal=None, width=4, height=4, num_particles=100):
+        super().__init__(list(dynamics_distributions) + list(render_distributions), initial_belief=initial_belief, num_particles=num_particles)
         self.dynamics_rules = list(dynamics_rules)
         self.render_rules = list(render_rules)
         self.width = width
