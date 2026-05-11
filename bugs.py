@@ -418,8 +418,8 @@ if __name__ == "__main__":
 
     elif args.command == "active":
         model = load_model(args.checkpoint)
-        learner = ActiveLearner(model, num_model_particles=args.num_model_particles,
-                                num_state_particles=args.num_state_particles)
+        model.num_particles = args.num_state_particles
+        learner = ActiveLearner(model, history=[observations[0]], num_model_particles=args.num_model_particles)
         learner.init_tree()
         compare_policies(
             learner,

@@ -2,27 +2,17 @@ import math
 from belief_tree import BeliefTree
 from model import *
 
-
-def model_entropy(node):
-    """Entropy of the marginal distribution over world-model particles in a BeliefNode."""
-    counts = {}
-    for model_idx, _ in node.particles:
-        counts[model_idx] = counts.get(model_idx, 0) + 1
-    n = len(node.particles)
-    return -sum((c / n) * math.log(c / n) for c in counts.values())
-
-
 class ActiveLearner:
 
-    def __init__(self, world_model, num_model_particles=20, num_state_particles=10):
+    def __init__(self, world_model, history, num_model_particles=20):
         self.world_model = world_model
         self.belief_tree = None
         self.num_model_particles = num_model_particles
-        self.num_state_particles = num_state_particles
+        self.history = history
 
     def init_tree(self):
         """Initialize belief tree from the model's initial_belief."""
-        self.belief_tree = BeliefTree(self.world_model, self.world_model.initial_belief, self.num_model_particles)
+        self.belief_tree = BeliefTree(self.world_model, self.history, self.num_model_particles)
 
     def rollout_policy(self, policy, n_rollouts=1):
         """
@@ -39,7 +29,7 @@ class ActiveLearner:
 
         node = self.belief_tree.root
         observations, actions = [], []
-        last_entropy = model_entropy(node)
+        last_entropy = node.histogram.entropy()
         infogains = []
         while True:
             action = policy(observations, actions)
@@ -48,7 +38,7 @@ class ActiveLearner:
             actions.append(action)
             obs, node = self.belief_tree.expand(node, action, add_to_tree=False)
             observations.append(obs)
-            new_entropy = model_entropy(node)
+            new_entropy = node.histogram.entropy()
             infogains.append(last_entropy - new_entropy)
             last_entropy = new_entropy
         return infogains

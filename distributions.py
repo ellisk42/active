@@ -31,6 +31,9 @@ class Categorical:
         else:
             raise ValueError("Unsupported type for multiplication")
         
+    def keys(self):
+        return self.logits.keys()
+        
     def __add__(self, other):
         # logsumexp the logits
         if isinstance(other, numbers.Number):

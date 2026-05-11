@@ -21,9 +21,10 @@ class BeliefNode:
     Just think of it as a bag of particles representing belief over a latent thing
     """
 
-    def __init__(self, particles, tree):
-        self.particles = particles   # list of (model_idx, state)
+    def __init__(self, histogram, tree, history=()):
+        self.histogram = histogram   # Categorical of model_idx
         self.tree = tree
+        self.history = list(history)  # [obs, act, obs, act, ...] from root to this node
         self.children = {}           # action → [(observation, BeliefNode), ...]
 
     def get_child(self, action, observation):
@@ -32,7 +33,7 @@ class BeliefNode:
             if obs == observation:
                 return child
         return None
-    
+
     def add_child(self, action, observation, child):
         """Add a child for (action, observation).  Error if one already exists by equality."""
         if action not in self.children:
@@ -46,20 +47,22 @@ class BeliefNode:
 
 class BeliefTree:
     """
-    Particle-based belief tree for belief space planning.
+    Tree for belief space planning.
 
     possible_models: a fixed list of sampled world-model copies, shared across
-    all nodes.  Each particle in a BeliefNode is (i, state) where i indexes
-    into this list.
+    all nodes.  Each particle in a BeliefNode indexes into this list.
     """
 
-    def __init__(self, world_model, initial_state_belief, num_model_particles):
-        """
-        initial_state_belief is a list of latent states that you might be in at the start.
-        each node in the tree maintains a set of particles of size (num_model_particles * len(initial_state_belief)) by taking the cross product of possible_models and initial_state_belief.
-        """
+    def __init__(self, world_model, initial_history, num_model_particles, exact_belief_updates=True):
         self.possible_models = world_model.make_particle_based_approximation(num_model_particles)
-        self.root = BeliefNode([(i, s) for i, model in enumerate(self.possible_models) for s in initial_state_belief], self)
+
+        histogram = Categorical({i: 1 for i in range(len(self.possible_models))})
+        
+        self.root = BeliefNode(histogram, self, initial_history)
+
+        self.exact_belief_updates = exact_belief_updates
+
+        assert len(initial_history) % 2 == 1, "History should be in the form [obs, act, obs, act, ..., obs]"
 
 
     def expand(self, node, action, add_to_tree=True):
@@ -67,41 +70,32 @@ class BeliefTree:
         Sample new belief given current belief and action.
         By default, also adds to tree.
         """
-        true_idx, true_state = random.choice(node.particles)
+        true_idx = node.histogram.normalize().sample()
         true_model = self.possible_models[true_idx]
-        true_next_state = true_model.sample_next_state(true_state, action)
-        observation = true_model.sample_observation_given_state(true_next_state)
+        history = node.history
+        observations, actions = history[::2], history[1::2]
+        next_observation = true_model.sample_observation(observations, actions + [action])
 
         # check if child already exists
-        if node.get_child(action, observation) is not None:
-            return observation, node.get_child(action, observation)
-        
+        if node.get_child(action, next_observation) is not None:
+            return next_observation, node.get_child(action, next_observation)
+
         # create and add the node
-        # as a heuristic we always add (true_idx, true_next_state) as a particle in the new node, to ensure that the sampled observation is possible under the new node's particles
-        # technically dont have to do this in large particle limit but it seems reasonable as a biasing heuristic to ensure we dont get all tiny-weight particles
+        # for each model in the belief, compute likelihood of next_observation given action and past history, to get a distribution over models for the new node
+        likelihoods = {i: self.possible_models[i].observation_log_likelihood(next_observation, observations, actions + [action])
+                       for i in node.histogram.keys()}
+        
+        # scale by likelihoods to get exact posterior
+        new_histogram = Categorical({i: node.histogram.logits[i] + likelihoods[i] for i in node.histogram.keys()}).normalize()
 
-        log_weights = []
-        particles = []
-        for idx, state in node.particles:
-            if len(particles) == 0:
-                # first one is copy of what we know work
-                model = self.possible_models[true_idx]
-                next_state = true_next_state
-            else:
-                model = self.possible_models[idx]
-                next_state = model.sample_next_state(state, action)
-            log_weights.append(model.observation_log_likelihood_given_state(next_state, observation))
-            particles.append((idx, next_state))
+        if not self.exact_belief_updates:
+            # resample
+            samples = [new_histogram.sample() for _ in range(len(self.possible_models))]
+            new_histogram = Categorical({i: math.log(samples.count(i)) for i in set(samples)}).normalize()
 
-        weight_dist = Categorical({k: w for k, w in enumerate(log_weights)})
-        log_obs_prob = weight_dist.Z.item() - math.log(len(node.particles))  # log p(observation | action, node)
-        weight_dist = weight_dist.normalize()
-        new_particles = [particles[weight_dist.sample()] for _ in particles]
-
-        new_node = BeliefNode(new_particles, self)
-        new_node.log_obs_prob = log_obs_prob  # store this for free while we have the weights around, since it can be useful for info-gain calculations
+        new_node = BeliefNode(new_histogram, self, history=node.history + [action, next_observation])
+        
         if add_to_tree:
-            node.add_child(action, observation, new_node)
+            node.add_child(action, next_observation, new_node)
 
-        return observation, new_node
-
+        return next_observation, new_node
